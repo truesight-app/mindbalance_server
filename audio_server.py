@@ -7,31 +7,15 @@ import io
 import base64
 from pydub import AudioSegment
 import csv
-import librosa
 
 app = Flask(__name__)
 
 # Load ONNX model
-session = ort.InferenceSession('YamNet.onnx')
+session = ort.InferenceSession('YamNet.onnx', providers=['CPUExecutionProvider'])
 input_name = session.get_inputs()[0].name
-output_names = [output.name for output in session.get_outputs()]
-print("Model input name:", input_name)
-print("Model output names:", output_names)
-
-# Audio processing parameters
-SAMPLE_RATE = 16000
-N_MEL_BANDS = 96  # Changed from 64 to 96
-WINDOW_SIZE = 400
-HOP_SIZE = 160
-
-# Load class map
-class_names = []
-with open('yamnet_class_map.csv') as csvfile:
-    reader = csv.DictReader(csvfile)
-    for row in reader:
-        class_names.append(row['display_name'])
 
 def convert_audio_to_wav(audio_bytes, input_format='m4a'):
+    """Convert audio bytes to WAV format"""
     audio = AudioSegment.from_file(io.BytesIO(audio_bytes), format=input_format)
     wav_io = io.BytesIO()
     audio.export(wav_io, format='wav')
@@ -39,31 +23,57 @@ def convert_audio_to_wav(audio_bytes, input_format='m4a'):
     return wav_io
 
 def process_audio(audio, sr):
-    # Convert to mono and resample if needed
+    """Process audio according to YAMNet requirements"""
+    # Convert to mono if stereo
     if len(audio.shape) > 1:
         audio = np.mean(audio, axis=1)
-    if sr != SAMPLE_RATE:
-        audio = resampy.resample(audio, sr, SAMPLE_RATE)
     
-    # Compute mel spectrogram
-    mel_spec = librosa.feature.melspectrogram(
-        y=audio,
-        sr=SAMPLE_RATE,
-        n_mels=N_MEL_BANDS,
-        n_fft=WINDOW_SIZE,
-        hop_length=HOP_SIZE,
-        fmin=125,
-        fmax=7500
-    )
+    # Resample to 16kHz if necessary
+    if sr != 16000:
+        audio = resampy.resample(audio, sr, 16000)
     
-    # Convert to log mel spectrogram
-    log_mel_spec = librosa.power_to_db(mel_spec, ref=np.max)
+    # Normalize the waveform to be in [-1, 1]
+    audio = audio / (np.max(np.abs(audio)) + 1e-10)
+    audio = audio.astype(np.float32)
     
-    # Normalize
-    log_mel_spec = (log_mel_spec - log_mel_spec.mean()) / log_mel_spec.std()
+    # Calculate spectrogram
+    frame_length = int(0.025 * 16000)  # 25ms
+    frame_step = int(0.010 * 16000)    # 10ms
     
-    # Reshape for model (batch_size, channels, mel_bands, time_steps)
-    return log_mel_spec.T.reshape(1, 1, 96, -1)[:, :, :, :64]
+    # Pad the signal to make sure we get enough frames
+    pad_len = frame_length
+    padded = np.pad(audio, (pad_len, pad_len), mode='reflect')
+    
+    # Frame the signal
+    frames = []
+    for i in range(0, len(padded) - frame_length, frame_step):
+        frames.append(padded[i:i + frame_length])
+    frames = np.array(frames)
+    
+    # Apply Hanning window
+    window = np.hanning(frame_length)
+    frames = frames * window
+    
+    # Compute FFT
+    fft = np.abs(np.fft.rfft(frames, axis=1))
+    
+    # Prepare for model input (1, 1, 96, 64)
+    # Take first 96 frames and reshape
+    if len(fft) < 96:
+        pad_frames = np.zeros((96 - len(fft), fft.shape[1]))
+        fft = np.vstack([fft, pad_frames])
+    else:
+        fft = fft[:96]
+    
+    # Reshape to model's expected input shape
+    model_input = fft.reshape(1, 1, 96, -1)
+    if model_input.shape[3] > 64:
+        model_input = model_input[:, :, :, :64]
+    elif model_input.shape[3] < 64:
+        pad_width = ((0, 0), (0, 0), (0, 0), (0, 64 - model_input.shape[3]))
+        model_input = np.pad(model_input, pad_width, mode='constant')
+    
+    return model_input
 
 @app.route('/analyze_audio', methods=['POST'])
 def analyze_audio():
@@ -88,14 +98,20 @@ def analyze_audio():
                 audio, sr = sf.read(io.BytesIO(audio_bytes))
         else:
             return jsonify({'predictions': []}), 400
-        
-        # Process audio into mel spectrogram
-        processed_audio = process_audio(audio, sr)
+
+        # Process audio
+        model_input = process_audio(audio, sr)
         
         # Run inference with ONNX
-        input_data = {input_name: processed_audio.astype(np.float32)}
-        outputs = session.run(output_names, input_data)
-        scores = outputs[0]  # Get just the scores from the output
+        outputs = session.run(None, {input_name: model_input.astype(np.float32)})
+        scores = outputs[0]
+        
+        # Load class names
+        class_names = []
+        with open('yamnet_class_map.csv') as csvfile:
+            reader = csv.DictReader(csvfile)
+            for row in reader:
+                class_names.append(row['display_name'])
         
         # Get top 5 predictions
         class_scores = np.mean(scores, axis=0)
