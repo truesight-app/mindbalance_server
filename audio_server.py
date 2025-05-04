@@ -105,6 +105,7 @@ def analyze_audio():
         # Run inference with ONNX
         outputs = session.run(None, {input_name: model_input.astype(np.float32)})
         scores = outputs[0]
+        print(scores)
         
         # Load class names
         class_names = []
