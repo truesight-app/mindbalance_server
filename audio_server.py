@@ -1,16 +1,35 @@
 import numpy as np
+import onnxruntime as ort
 from flask import Flask, request, jsonify
 import soundfile as sf
 import resampy
 import io
 import base64
 from pydub import AudioSegment
-from qai_hub_models.models.yamnet import Model, YAMNetConfig
+import csv
+import librosa
 
 app = Flask(__name__)
 
-# Load YamNet model from QAI Hub
-model = Model.from_pretrained()
+# Load ONNX model
+session = ort.InferenceSession('YamNet.onnx')
+input_name = session.get_inputs()[0].name
+output_names = [output.name for output in session.get_outputs()]
+print("Model input name:", input_name)
+print("Model output names:", output_names)
+
+# Audio processing parameters
+SAMPLE_RATE = 16000
+N_MEL_BANDS = 96  # Changed from 64 to 96
+WINDOW_SIZE = 400
+HOP_SIZE = 160
+
+# Load class map
+class_names = []
+with open('yamnet_class_map.csv') as csvfile:
+    reader = csv.DictReader(csvfile)
+    for row in reader:
+        class_names.append(row['display_name'])
 
 def convert_audio_to_wav(audio_bytes, input_format='m4a'):
     audio = AudioSegment.from_file(io.BytesIO(audio_bytes), format=input_format)
@@ -20,19 +39,31 @@ def convert_audio_to_wav(audio_bytes, input_format='m4a'):
     return wav_io
 
 def process_audio(audio, sr):
-    """Process audio to match YamNet input requirements."""
-    # Convert to mono if stereo
+    # Convert to mono and resample if needed
     if len(audio.shape) > 1:
         audio = np.mean(audio, axis=1)
+    if sr != SAMPLE_RATE:
+        audio = resampy.resample(audio, sr, SAMPLE_RATE)
     
-    # Resample to 16kHz if necessary
-    if sr != 16000:
-        audio = resampy.resample(audio, sr, 16000)
+    # Compute mel spectrogram
+    mel_spec = librosa.feature.melspectrogram(
+        y=audio,
+        sr=SAMPLE_RATE,
+        n_mels=N_MEL_BANDS,
+        n_fft=WINDOW_SIZE,
+        hop_length=HOP_SIZE,
+        fmin=125,
+        fmax=7500
+    )
     
-    # Normalize audio
-    audio = audio / (np.max(np.abs(audio)) + 1e-8)
+    # Convert to log mel spectrogram
+    log_mel_spec = librosa.power_to_db(mel_spec, ref=np.max)
     
-    return audio.astype(np.float32)
+    # Normalize
+    log_mel_spec = (log_mel_spec - log_mel_spec.mean()) / log_mel_spec.std()
+    
+    # Reshape for model (batch_size, channels, mel_bands, time_steps)
+    return log_mel_spec.T.reshape(1, 1, 96, -1)[:, :, :, :64]
 
 @app.route('/analyze_audio', methods=['POST'])
 def analyze_audio():
@@ -57,26 +88,28 @@ def analyze_audio():
                 audio, sr = sf.read(io.BytesIO(audio_bytes))
         else:
             return jsonify({'predictions': []}), 400
-
-        # Process audio
+        
+        # Process audio into mel spectrogram
         processed_audio = process_audio(audio, sr)
         
-        # Run inference using QAI Hub model
-        predictions = model({"waveform": processed_audio})
+        # Run inference with ONNX
+        input_data = {input_name: processed_audio.astype(np.float32)}
+        outputs = session.run(output_names, input_data)
+        scores = outputs[0]  # Get just the scores from the output
         
         # Get top 5 predictions
-        scores = predictions['scores']
-        top_5_indices = np.argsort(scores)[-5:][::-1]
+        class_scores = np.mean(scores, axis=0)
+        top_5_indices = np.argsort(class_scores)[-5:][::-1]
         
-        results = [
+        predictions = [
             {
-                'label': predictions['labels'][idx],
-                'confidence': float(scores[idx] * 100)
+                'label': class_names[idx],
+                'confidence': float(class_scores[idx] * 100)
             }
             for idx in top_5_indices
         ]
         
-        return jsonify({'predictions': results})
+        return jsonify({'predictions': predictions})
     
     except Exception as e:
         print(f"Error processing audio: {str(e)}")
