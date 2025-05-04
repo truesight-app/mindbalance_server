@@ -1,8 +1,7 @@
-numpy
-onnxruntime
-Flask
-soundfile
-resampy
-pydub
-gunicorn
-librosa
+numpy==1.24.3
+Flask==2.3.3
+soundfile==0.12.1
+resampy==0.4.2
+pydub==0.25.1
+gunicorn==21.2.0
+qai-hub-models[yamnet]

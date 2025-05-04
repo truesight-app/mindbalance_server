@@ -1,77 +1,16 @@
 import numpy as np
-import onnxruntime as ort
 from flask import Flask, request, jsonify
 import soundfile as sf
 import resampy
 import io
 import base64
 from pydub import AudioSegment
-import csv
-import librosa
+from qai_hub_models.models.yamnet import Model, YAMNetConfig
 
 app = Flask(__name__)
 
-# Load ONNX model
-session = ort.InferenceSession('YamNet.onnx', providers=['CPUExecutionProvider'])
-input_name = session.get_inputs()[0].name
-
-# Audio processing parameters for YamNet
-SAMPLE_RATE = 16000
-WINDOW_LENGTH = 0.025  # 25ms
-HOP_LENGTH = 0.010    # 10ms
-N_MEL_BANDS = 64
-
-def log_mel_spectrogram(waveform):
-    """Convert waveform to log mel spectrogram following YamNet preprocessing."""
-    # Compute STFT
-    n_fft = int(SAMPLE_RATE * WINDOW_LENGTH)
-    hop_length = int(SAMPLE_RATE * HOP_LENGTH)
-    
-    # Compute mel spectrogram
-    mel_spec = librosa.feature.melspectrogram(
-        y=waveform,
-        sr=SAMPLE_RATE,
-        n_fft=n_fft,
-        hop_length=hop_length,
-        n_mels=N_MEL_BANDS,
-        fmin=125,
-        fmax=7500
-    )
-    
-    # Convert to log mel spectrogram
-    log_mel = librosa.power_to_db(mel_spec, ref=np.max)
-    
-    # Normalize
-    log_mel = (log_mel - log_mel.mean()) / (log_mel.std() + 1e-8)
-    
-    # YamNet expects (1, 1, 96, 64) input shape
-    # Pad or trim to 96 frames
-    target_length = 96
-    current_length = log_mel.shape[1]
-    
-    if current_length < target_length:
-        pad_width = target_length - current_length
-        log_mel = np.pad(log_mel, ((0, 0), (0, pad_width)))
-    elif current_length > target_length:
-        log_mel = log_mel[:, :target_length]
-    
-    # Reshape to model's expected input shape (1, 1, 96, 64)
-    return log_mel.T.reshape(1, 1, 96, 64)
-
-def process_audio(audio, sr):
-    """Process audio to match YamNet input requirements."""
-    # Convert to mono if stereo
-    if len(audio.shape) > 1:
-        audio = np.mean(audio, axis=1)
-    
-    # Resample to 16kHz if necessary
-    if sr != SAMPLE_RATE:
-        audio = resampy.resample(audio, sr, SAMPLE_RATE)
-    
-    # Normalize audio
-    audio = audio / (np.max(np.abs(audio)) + 1e-8)
-    
-    return log_mel_spectrogram(audio)
+# Load YamNet model from QAI Hub
+model = Model.from_pretrained()
 
 def convert_audio_to_wav(audio_bytes, input_format='m4a'):
     audio = AudioSegment.from_file(io.BytesIO(audio_bytes), format=input_format)
@@ -80,12 +19,20 @@ def convert_audio_to_wav(audio_bytes, input_format='m4a'):
     wav_io.seek(0)
     return wav_io
 
-# Load class map
-class_names = []
-with open('yamnet_class_map.csv') as csvfile:
-    reader = csv.DictReader(csvfile)
-    for row in reader:
-        class_names.append(row['display_name'])
+def process_audio(audio, sr):
+    """Process audio to match YamNet input requirements."""
+    # Convert to mono if stereo
+    if len(audio.shape) > 1:
+        audio = np.mean(audio, axis=1)
+    
+    # Resample to 16kHz if necessary
+    if sr != 16000:
+        audio = resampy.resample(audio, sr, 16000)
+    
+    # Normalize audio
+    audio = audio / (np.max(np.abs(audio)) + 1e-8)
+    
+    return audio.astype(np.float32)
 
 @app.route('/analyze_audio', methods=['POST'])
 def analyze_audio():
@@ -111,26 +58,25 @@ def analyze_audio():
         else:
             return jsonify({'predictions': []}), 400
 
-        # Process audio to match model input requirements
+        # Process audio
         processed_audio = process_audio(audio, sr)
         
-        # Run inference
-        outputs = session.run(None, {input_name: processed_audio.astype(np.float32)})
-        scores = outputs[0]
+        # Run inference using QAI Hub model
+        predictions = model({"waveform": processed_audio})
         
         # Get top 5 predictions
-        class_scores = np.mean(scores, axis=0)
-        top_5_indices = np.argsort(class_scores)[-5:][::-1]
+        scores = predictions['scores']
+        top_5_indices = np.argsort(scores)[-5:][::-1]
         
-        predictions = [
+        results = [
             {
-                'label': class_names[idx],
-                'confidence': float(class_scores[idx] * 100)
+                'label': predictions['labels'][idx],
+                'confidence': float(scores[idx] * 100)
             }
             for idx in top_5_indices
         ]
         
-        return jsonify({'predictions': predictions})
+        return jsonify({'predictions': results})
     
     except Exception as e:
         print(f"Error processing audio: {str(e)}")
