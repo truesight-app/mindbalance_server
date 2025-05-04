@@ -7,6 +7,7 @@ import io
 import base64
 from pydub import AudioSegment
 import csv
+import librosa
 
 app = Flask(__name__)
 
@@ -34,46 +35,40 @@ def process_audio(audio, sr):
     
     # Normalize the waveform to be in [-1, 1]
     audio = audio / (np.max(np.abs(audio)) + 1e-10)
-    audio = audio.astype(np.float32)
     
-    # Calculate spectrogram
-    frame_length = int(0.025 * 16000)  # 25ms
-    frame_step = int(0.010 * 16000)    # 10ms
+    # Parameters for mel spectrogram
+    window_length_seconds = 0.025
+    hop_length_seconds = 0.010
+    n_fft = int(round(window_length_seconds * 16000))
+    hop_length = int(round(hop_length_seconds * 16000))
     
-    # Pad the signal to make sure we get enough frames
-    pad_len = frame_length
-    padded = np.pad(audio, (pad_len, pad_len), mode='reflect')
+    # Generate mel spectrogram
+    mel_spec = librosa.feature.melspectrogram(
+        y=audio,
+        sr=16000,
+        n_fft=n_fft,
+        hop_length=hop_length,
+        n_mels=64,
+        fmin=125.0,
+        fmax=7500.0,
+        power=1.0
+    )
     
-    # Frame the signal
-    frames = []
-    for i in range(0, len(padded) - frame_length, frame_step):
-        frames.append(padded[i:i + frame_length])
-    frames = np.array(frames)
+    # Convert to log mel spectrogram
+    log_mel_spec = librosa.power_to_db(mel_spec, ref=np.max)
     
-    # Apply Hanning window
-    window = np.hanning(frame_length)
-    frames = frames * window
+    # Normalize
+    log_mel_spec = (log_mel_spec - log_mel_spec.mean()) / (log_mel_spec.std() + 1e-5)
     
-    # Compute FFT
-    fft = np.abs(np.fft.rfft(frames, axis=1))
-    
-    # Prepare for model input (1, 1, 96, 64)
-    # Take first 96 frames and reshape
-    if len(fft) < 96:
-        pad_frames = np.zeros((96 - len(fft), fft.shape[1]))
-        fft = np.vstack([fft, pad_frames])
+    # Prepare input shape (1, 1, 96, 64)
+    if log_mel_spec.shape[1] < 96:
+        pad_width = ((0, 0), (0, 96 - log_mel_spec.shape[1]))
+        log_mel_spec = np.pad(log_mel_spec, pad_width, mode='constant')
     else:
-        fft = fft[:96]
+        log_mel_spec = log_mel_spec[:, :96]
     
-    # Reshape to model's expected input shape
-    model_input = fft.reshape(1, 1, 96, -1)
-    if model_input.shape[3] > 64:
-        model_input = model_input[:, :, :, :64]
-    elif model_input.shape[3] < 64:
-        pad_width = ((0, 0), (0, 0), (0, 0), (0, 64 - model_input.shape[3]))
-        model_input = np.pad(model_input, pad_width, mode='constant')
-    
-    return model_input
+    # Reshape to model's expected input shape (1, 1, 96, 64)
+    return log_mel_spec.T.reshape(1, 1, 96, 64)
 
 @app.route('/analyze_audio', methods=['POST'])
 def analyze_audio():
@@ -105,7 +100,6 @@ def analyze_audio():
         # Run inference with ONNX
         outputs = session.run(None, {input_name: model_input.astype(np.float32)})
         scores = outputs[0]
-        print(scores)
         
         # Load class names
         class_names = []
