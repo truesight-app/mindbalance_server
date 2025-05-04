@@ -1,8 +1,8 @@
 numpy
-tensorflow
-tensorflow-hub
+onnxruntime
 Flask
 soundfile
 resampy
 pydub
 gunicorn
+librosa

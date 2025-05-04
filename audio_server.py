@@ -1,6 +1,5 @@
 import numpy as np
-import tensorflow as tf
-import tensorflow_hub as hub
+import onnxruntime as ort
 from flask import Flask, request, jsonify
 import soundfile as sf
 import resampy
@@ -8,11 +7,22 @@ import io
 import base64
 from pydub import AudioSegment
 import csv
+import librosa
 
 app = Flask(__name__)
 
-# Load YAMNet model
-model = hub.load('https://tfhub.dev/google/yamnet/1')
+# Load ONNX model
+session = ort.InferenceSession('YamNet.onnx')
+input_name = session.get_inputs()[0].name
+output_names = [output.name for output in session.get_outputs()]
+print("Model input name:", input_name)
+print("Model output names:", output_names)
+
+# Audio processing parameters
+SAMPLE_RATE = 16000
+N_MEL_BANDS = 96  # Changed from 64 to 96
+WINDOW_SIZE = 400
+HOP_SIZE = 160
 
 # Load class map
 class_names = []
@@ -27,6 +37,33 @@ def convert_audio_to_wav(audio_bytes, input_format='m4a'):
     audio.export(wav_io, format='wav')
     wav_io.seek(0)
     return wav_io
+
+def process_audio(audio, sr):
+    # Convert to mono and resample if needed
+    if len(audio.shape) > 1:
+        audio = np.mean(audio, axis=1)
+    if sr != SAMPLE_RATE:
+        audio = resampy.resample(audio, sr, SAMPLE_RATE)
+    
+    # Compute mel spectrogram
+    mel_spec = librosa.feature.melspectrogram(
+        y=audio,
+        sr=SAMPLE_RATE,
+        n_mels=N_MEL_BANDS,
+        n_fft=WINDOW_SIZE,
+        hop_length=HOP_SIZE,
+        fmin=125,
+        fmax=7500
+    )
+    
+    # Convert to log mel spectrogram
+    log_mel_spec = librosa.power_to_db(mel_spec, ref=np.max)
+    
+    # Normalize
+    log_mel_spec = (log_mel_spec - log_mel_spec.mean()) / log_mel_spec.std()
+    
+    # Reshape for model (batch_size, channels, mel_bands, time_steps)
+    return log_mel_spec.T.reshape(1, 1, 96, -1)[:, :, :, :64]
 
 @app.route('/analyze_audio', methods=['POST'])
 def analyze_audio():
@@ -52,30 +89,24 @@ def analyze_audio():
         else:
             return jsonify({'predictions': []}), 400
         
-        # Convert to mono if stereo
-        if len(audio.shape) > 1:
-            audio = np.mean(audio, axis=1)
+        # Process audio into mel spectrogram
+        processed_audio = process_audio(audio, sr)
         
-        # Ensure audio is float32
-        audio = audio.astype(np.float32)
-        
-        # Resample to 16kHz if necessary
-        if sr != 16000:
-            audio = resampy.resample(audio, sr, 16000)
-        
-        # Run inference
-        scores, embeddings, mel_spec = model(audio)
+        # Run inference with ONNX
+        input_data = {input_name: processed_audio.astype(np.float32)}
+        outputs = session.run(output_names, input_data)
+        scores = outputs[0]  # Get just the scores from the output
         
         # Get top 5 predictions
-        class_scores = tf.reduce_mean(scores, axis=0)
-        top_5_indices = tf.argsort(class_scores, direction='DESCENDING')[:5]
+        class_scores = np.mean(scores, axis=0)
+        top_5_indices = np.argsort(class_scores)[-5:][::-1]
         
         predictions = [
             {
                 'label': class_names[idx],
-                'confidence': float(class_scores[idx].numpy() * 100)
+                'confidence': float(class_scores[idx] * 100)
             }
-            for idx in top_5_indices.numpy()
+            for idx in top_5_indices
         ]
         
         return jsonify({'predictions': predictions})
